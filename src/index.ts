@@ -75,6 +75,18 @@ console.table(
     }))
 );
 
+function reverseBits(code: number, length: number) {
+    let reversed = 0;
+
+    for (let i = 0; i < length; i++) {
+        reversed <<= 1;
+        reversed |= code & 1;
+        code >>= 1;
+    }
+
+    return reversed;
+}
+
 function buildCanonicalHuffman(lengths: number[]): HuffmanEntry[] {
     const blCount = new Map<number, number>();
 
