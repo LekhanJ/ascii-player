@@ -1,5 +1,5 @@
 import { BitReader } from "./bitreader";
-import type { HuffmanEntry } from "./types";
+import type { HuffmanEntry, HuffmanTable } from "./types";
 
 const buffer = await Bun.file("/home/kenji/Projects/ascii/frames/frame_5700.png").arrayBuffer();
 const bytes = new Uint8Array(buffer);
@@ -64,16 +64,158 @@ console.log({
     codeLengths
 });
 
-const entries = buildCanonicalHuffman(codeLengths);
-console.table(
-    entries.map(entry => ({
-        symbol: entry.symbol,
-        length: entry.length,
-        code: entry.code
-            .toString(2)
-            .padStart(entry.length, "0")
-    }))
+const codeLengthTable = buildCanonicalHuffman(codeLengths);
+
+const totalLengths = (hlit + 257) + (hdist + 1);
+const lengths: number[] = [];
+while (lengths.length < totalLengths) {
+    const codeLengthSymbol = decodeSymbol(reader, codeLengthTable);
+    
+    if (codeLengthSymbol >=0 && codeLengthSymbol <= 15) {
+        lengths.push(codeLengthSymbol);
+    } else if (codeLengthSymbol === 16) {
+        const extra = reader.readBits(2);
+        const repeatCount = extra + 3;
+        const previous = lengths[lengths.length - 1];
+
+        if (previous === undefined) {
+            throw new Error("16 without previous length");
+        }
+
+        for (let i = 0; i < repeatCount; i++) {
+            lengths.push(previous);
+        }
+    } else if (codeLengthSymbol === 17) {
+        const extra = reader.readBits(3);
+        const repeatCount = extra + 3;
+
+        for (let i = 0; i < repeatCount; i++) {
+            lengths.push(0);
+        }
+    } else if (codeLengthSymbol === 18) {
+        const extra = reader.readBits(7);
+        const repeatCount = extra + 11;
+
+        for (let i = 0; i < repeatCount; i++) {
+            lengths.push(0);
+        }
+    }
+}
+
+const literalLengths = lengths.slice(0, hlit + 257);
+const distanceLengths = lengths.slice(hlit + 257);
+
+const literalTable = buildCanonicalHuffman(literalLengths);
+const distanceTable = buildCanonicalHuffman(distanceLengths);
+
+const LENGTH_BASE = [
+    3, 4, 5, 6, 7, 8, 9, 10,
+    11, 13, 15, 17,
+    19, 23, 27, 31,
+    35, 43, 51, 59,
+    67, 83, 99, 115,
+    131, 163, 195, 227,
+    258
+];
+
+const LENGTH_EXTRA = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1,
+    2, 2, 2, 2,
+    3, 3, 3, 3,
+    4, 4, 4, 4,
+    5, 5, 5, 5,
+    0
+];
+
+const DIST_BASE = [
+    1,     2,     3,     4,
+    5,     7,     9,     13,
+    17,    25,    33,    49,
+    65,    97,    129,   193,
+    257,   385,   513,   769,
+    1025,  1537,  2049,  3073,
+    4097,  6145,  8193,  12289,
+    16385, 24577
+];
+
+const DIST_EXTRA = [
+    0, 0, 0, 0,
+    1, 1, 2, 2,
+    3, 3, 4, 4,
+    5, 5, 6, 6,
+    7, 7, 8, 8,
+    9, 9, 10, 10,
+    11, 11, 12, 12,
+    13, 13
+];
+
+const output: number[] = [];
+while (true) {
+    const literalSymbol = decodeSymbol(reader, literalTable);
+    
+    // literal byte
+    if (literalSymbol < 256) {
+        output.push(literalSymbol);
+        continue;
+    }
+
+    if (literalSymbol === 256) {
+        console.log("End of block");
+        break;
+    }
+
+    // length code
+    const lengthIndex = literalSymbol - 257;
+    const baseLength = LENGTH_BASE[lengthIndex]!;
+    const lengthExtraBits = LENGTH_EXTRA[lengthIndex]!;
+    const lengthExtra = reader.readBits(lengthExtraBits);
+    const length = baseLength + lengthExtra;
+
+    // distance code
+    const distanceSymbol = decodeSymbol(reader, distanceTable);
+    
+    const distanceBase = DIST_BASE[distanceSymbol]!;
+    const distanceExtraBits =  DIST_EXTRA[distanceSymbol]!;
+    const distanceExtra = reader.readBits(distanceExtraBits);
+    const distance = distanceBase + distanceExtra;
+
+    // copy previous bytes
+    for (let i = 0; i < length; i++) {
+        const value = output[output.length - distance];
+
+        if (value === undefined) {
+            throw new Error(`Invalid distance ${distance}`);
+        }
+
+        output.push(value);
+    }
+}
+
+console.log(
+    "Inflated bytes:",
+    output.length
 );
+
+
+function decodeSymbol(reader: BitReader, table: HuffmanTable): number {
+
+    let code = 0;
+    
+    for (let length = 1; length <= table.maxLength; length++) {
+        const bit = reader.readBit();
+
+        code |= bit << (length - 1);
+        
+        const key = (length << 16) | code;
+
+        const symbol = table.lookup.get(key);
+
+        if (symbol !== undefined) return symbol;
+    }
+
+    throw new Error("Invalid Huffman code")
+}
 
 function reverseBits(code: number, length: number) {
     let reversed = 0;
@@ -87,7 +229,7 @@ function reverseBits(code: number, length: number) {
     return reversed;
 }
 
-function buildCanonicalHuffman(lengths: number[]): HuffmanEntry[] {
+function buildCanonicalHuffman(lengths: number[]): HuffmanTable {
     const blCount = new Map<number, number>();
 
     for (const len of lengths) {
@@ -96,11 +238,11 @@ function buildCanonicalHuffman(lengths: number[]): HuffmanEntry[] {
         blCount.set(len, (blCount.get(len) ?? 0) + 1);
     }
 
-    const maxBits = Math.max(...lengths);
-    const nextCode = new Array(maxBits + 1).fill(0);
+    const maxLength = Math.max(...lengths);
+    const nextCode = new Array(maxLength + 1).fill(0);
     
     let code = 0;
-    for (let bits = 1; bits <= maxBits; bits++) {
+    for (let bits = 1; bits <= maxLength; bits++) {
         const previousLengthCount = blCount.get(bits - 1) ?? 0;
         code = (code + previousLengthCount) << 1;
         nextCode[bits] = code;
@@ -124,7 +266,21 @@ function buildCanonicalHuffman(lengths: number[]): HuffmanEntry[] {
         nextCode[len!]++;
     }
 
-    return entries;
+    const lookup = new Map<number, number>();
+
+    for (const entry of entries) {
+        const reverseCode = reverseBits(entry.code, entry.length);
+
+        const key = (entry.length << 16) | reverseCode;
+
+        lookup.set(key, entry.symbol);
+    }
+
+    return {
+        entries,
+        lookup,
+        maxLength
+    };
 }
 
 function getZlibHeaders(data: Uint8Array) {
