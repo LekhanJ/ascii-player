@@ -150,8 +150,16 @@ const asciiFrame = renderAscii(pixels, pngHeader.width, pngHeader.height);
 console.log(asciiFrame);
 
 
+function colorize(char: string, r: number, g: number, b: number): string {
+    return `\x1b[38;2;${r};${g};${b}m${char}`;
+}
+
+function resetColor(): string {
+    return "\x1b[0m";
+}
+
 function renderAscii(pixels: Uint8Array, width: number, height: number): string {
-    const targetWidth = 80;
+    const targetWidth = 140;
     const xStep = width / targetWidth;
     const yStep = xStep * 2;
 
@@ -170,20 +178,15 @@ function renderAscii(pixels: Uint8Array, width: number, height: number): string 
             const g = pixels[pixelIndex + 1]!;
             const b = pixels[pixelIndex + 2]!;
 
-            const bright = brightness(r, g, b);
+            const char = "█";
 
-            line += brightnessToAscii(bright);
+            line += colorize(char, r, g, b);
         }
 
-        frame += line + "\n";
+        frame += line + resetColor() + "\n";
     }
 
     return frame;
-}
-
-function brightnessToAscii(value: number): string {
-    const index = Math.floor(value * ASCII.length / 256);
-    return ASCII[Math.min(index, ASCII.length - 1)]!;
 }
 
 function brightness(r: number, g: number, b: number): number {
