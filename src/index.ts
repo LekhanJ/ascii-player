@@ -1,9 +1,15 @@
 import { BitReader } from "./bitreader";
-import type { HuffmanEntry, HuffmanTable } from "./types";
+import type { HuffmanEntry, HuffmanTable, PngHeader, Scanline } from "./types";
 
 const buffer = await Bun.file("/home/kenji/Projects/ascii/frames/frame_5700.png").arrayBuffer();
 const bytes = new Uint8Array(buffer);
 const idatChunks: Uint8Array[] = [];
+let pngHeader: PngHeader = {
+    width: 0,
+    height: 0,
+    bitDepth: 0,
+    colorType: 0
+};
 
 verifySignature(bytes);
 walkBytes(bytes);
@@ -21,92 +27,14 @@ const fLevel = flg! >> 6;                 // get the upper 2 bits (FLEVEL)
 
 if (compressionMethod !== 8) throw new Error("Unsupported compression method");
 
-const header = (cmf! << 8) | flg!;        // zlib checksum rule: (CMF * 256 + FLG) % 31 should be 0
-if (header % 31 !== 0) {
+const zlibHeader = (cmf! << 8) | flg!;        // zlib checksum rule: (CMF * 256 + FLG) % 31 should be 0
+if (zlibHeader % 31 !== 0) {
     throw new Error("Invalid zlib header");
 }
 
 const deflateData = merged.slice(2, merged.length - 4);
 const reader = new BitReader(deflateData);
 
-const bfinal = reader.readBits(1);
-const btype = reader.readBits(2);
-console.log({
-    bfinal, 
-    btype
-});
-
-const hlit = reader.readBits(5);
-const hdist = reader.readBits(5);
-const hclen = reader.readBits(4);
-console.log({
-    hlit,
-    hdist,
-    hclen
-});
-
-const CODE_LENGTH_ORDER = [
-  16, 17, 18,
-   0,  8,  7,  9,
-   6, 10,  5, 11,
-   4, 12,  3, 13,
-   2, 14,  1, 15
-];
-
-const codeLengths = new Array(19).fill(0);
-for (let i=0; i < hclen+4; i++) {
-    const length = reader.readBits(3);
-
-    codeLengths[CODE_LENGTH_ORDER[i]!] = length;   // get lengths of Huffman codes
-}
-
-console.log({
-    codeLengths
-});
-
-const codeLengthTable = buildCanonicalHuffman(codeLengths);
-
-const totalLengths = (hlit + 257) + (hdist + 1);
-const lengths: number[] = [];
-while (lengths.length < totalLengths) {
-    const codeLengthSymbol = decodeSymbol(reader, codeLengthTable);
-    
-    if (codeLengthSymbol >=0 && codeLengthSymbol <= 15) {
-        lengths.push(codeLengthSymbol);
-    } else if (codeLengthSymbol === 16) {
-        const extra = reader.readBits(2);
-        const repeatCount = extra + 3;
-        const previous = lengths[lengths.length - 1];
-
-        if (previous === undefined) {
-            throw new Error("16 without previous length");
-        }
-
-        for (let i = 0; i < repeatCount; i++) {
-            lengths.push(previous);
-        }
-    } else if (codeLengthSymbol === 17) {
-        const extra = reader.readBits(3);
-        const repeatCount = extra + 3;
-
-        for (let i = 0; i < repeatCount; i++) {
-            lengths.push(0);
-        }
-    } else if (codeLengthSymbol === 18) {
-        const extra = reader.readBits(7);
-        const repeatCount = extra + 11;
-
-        for (let i = 0; i < repeatCount; i++) {
-            lengths.push(0);
-        }
-    }
-}
-
-const literalLengths = lengths.slice(0, hlit + 257);
-const distanceLengths = lengths.slice(hlit + 257);
-
-const literalTable = buildCanonicalHuffman(literalLengths);
-const distanceTable = buildCanonicalHuffman(distanceLengths);
 
 const LENGTH_BASE = [
     3, 4, 5, 6, 7, 8, 9, 10,
@@ -150,21 +78,119 @@ const DIST_EXTRA = [
     13, 13
 ];
 
+
 const output: number[] = [];
-while (true) {
-    const literalSymbol = decodeSymbol(reader, literalTable);
+let finalBlock: boolean = false;
+let blockCount: number = 0;
+
+while (!finalBlock) {
+
+    const bfinal = reader.readBits(1);
+    const btype = reader.readBits(2);
     
-    // literal byte
-    if (literalSymbol < 256) {
-        output.push(literalSymbol);
-        continue;
+    finalBlock = bfinal === 1;
+    blockCount++;
+
+    if (btype !== 2) {
+        throw new Error(`Unsupported block type ${btype}`);
     }
 
-    if (literalSymbol === 256) {
-        console.log("End of block");
-        break;
+    const { literalTable, distanceTable } = buildDynamicTrees(reader);
+
+    decodeBlock(reader, literalTable, distanceTable, output);
+}
+
+
+const bytePerPixel = 3;
+const stride = pngHeader.width * bytePerPixel;
+
+const scanlines: Scanline[] = [];
+let offset = 0;
+
+for (let row = 0; row < pngHeader.height; row++) {
+    const filterType = output[offset]!;
+
+    offset++;
+
+    const data = Uint8Array.from(output.slice(offset, offset + stride));
+
+    offset += stride;
+
+    scanlines.push({
+        filterType,
+        data
+    });
+}
+
+// Used to check filters
+// const filterCounts = new Map<number, number>();
+
+// for (const scanline of scanlines) {
+//     filterCounts.set(
+//         scanline.filterType,
+//         (filterCounts.get(
+//             scanline.filterType
+//         ) ?? 0) + 1
+//     );
+// }
+// console.log(filterCounts);
+
+const pixels = new Uint8Array(pngHeader.width * pngHeader.height * bytePerPixel);
+let position = 0;
+
+for (const scanline of scanlines) {
+    pixels.set(scanline.data, position);
+    position += scanline.data.length;
+}
+
+const ASCII = "@%#*+=-:. ";
+
+const asciiFrame = renderAscii(pixels, pngHeader.width, pngHeader.height);
+
+console.log(asciiFrame);
+
+
+function renderAscii(pixels: Uint8Array, width: number, height: number): string {
+    const targetWidth = 80;
+    const xStep = width / targetWidth;
+    const yStep = xStep * 2;
+
+    let frame = "";
+
+    for (let y = 0; y < height; y += yStep) {
+        let line = "";
+
+        for (let x = 0; x < width; x += xStep) {
+            const pixelX = Math.floor(x);
+            const pixelY = Math.floor(y);
+
+            const pixelIndex = (pixelY * width + pixelX) * 3;
+
+            const r = pixels[pixelIndex]!;
+            const g = pixels[pixelIndex + 1]!;
+            const b = pixels[pixelIndex + 2]!;
+
+            const bright = brightness(r, g, b);
+
+            line += brightnessToAscii(bright);
+        }
+
+        frame += line + "\n";
     }
 
+    return frame;
+}
+
+function brightnessToAscii(value: number): string {
+    const index = Math.floor(value * ASCII.length / 256);
+    return ASCII[Math.min(index, ASCII.length - 1)]!;
+}
+
+function brightness(r: number, g: number, b: number): number {
+    return Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+}
+
+function decodeLengthDistance(reader: BitReader, literalSymbol: number, distanceTable: HuffmanTable, output: number[]) {
     // length code
     const lengthIndex = literalSymbol - 257;
     const baseLength = LENGTH_BASE[lengthIndex]!;
@@ -174,7 +200,9 @@ while (true) {
 
     // distance code
     const distanceSymbol = decodeSymbol(reader, distanceTable);
-    
+    if (distanceSymbol > 29) {
+        throw new Error(`Invalid distance symbol ${distanceSymbol}`);
+    }
     const distanceBase = DIST_BASE[distanceSymbol]!;
     const distanceExtraBits =  DIST_EXTRA[distanceSymbol]!;
     const distanceExtra = reader.readBits(distanceExtraBits);
@@ -192,11 +220,98 @@ while (true) {
     }
 }
 
-console.log(
-    "Inflated bytes:",
-    output.length
-);
+function decodeBlock(reader: BitReader, literalTable: HuffmanTable, distanceTable: HuffmanTable, output: number[]) {
+    while (true) {
+        const literalSymbol = decodeSymbol(reader, literalTable);
+    
+        // literal byte
+        if (literalSymbol < 256) {
+            output.push(literalSymbol);
+            continue;
+        }
 
+        // end of block
+        if (literalSymbol === 256) {
+            return;
+        }
+
+        decodeLengthDistance(reader, literalSymbol, distanceTable, output);
+    }
+}
+
+function buildDynamicTrees(reader: BitReader) {
+    const hlit = reader.readBits(5);
+    const hdist = reader.readBits(5);
+    const hclen = reader.readBits(4);
+
+    const CODE_LENGTH_ORDER = [
+        16, 17, 18,
+        0,  8,  7,  9,
+        6, 10,  5, 11,
+        4, 12,  3, 13,
+        2, 14,  1, 15
+    ];
+
+    const codeLengths = new Array(19).fill(0);
+    for (let i=0; i < hclen+4; i++) {
+        const length = reader.readBits(3);
+
+        codeLengths[CODE_LENGTH_ORDER[i]!] = length;   // get lengths of Huffman codes
+    }
+
+    const codeLengthTable = buildCanonicalHuffman(codeLengths);
+
+    const totalLengths = (hlit + 257) + (hdist + 1);
+    const lengths: number[] = [];
+
+    while (lengths.length < totalLengths) {
+        const codeLengthSymbol = decodeSymbol(reader, codeLengthTable);
+        
+        if (codeLengthSymbol >=0 && codeLengthSymbol <= 15) {
+            lengths.push(codeLengthSymbol);
+
+        } else if (codeLengthSymbol === 16) {
+            const extra = reader.readBits(2);
+            const repeatCount = extra + 3;
+            const previous = lengths[lengths.length - 1];
+
+            if (previous === undefined) {
+                throw new Error("16 without previous length");
+            }
+
+            for (let i = 0; i < repeatCount; i++) {
+                lengths.push(previous);
+            }
+
+        } else if (codeLengthSymbol === 17) {
+            const extra = reader.readBits(3);
+            const repeatCount = extra + 3;
+
+            for (let i = 0; i < repeatCount; i++) {
+                lengths.push(0);
+            }
+
+        } else if (codeLengthSymbol === 18) {
+            const extra = reader.readBits(7);
+            const repeatCount = extra + 11;
+
+            for (let i = 0; i < repeatCount; i++) {
+                lengths.push(0);
+            }
+        }
+    }
+
+    const literalLengths = lengths.slice(0, hlit + 257);
+    const distanceLengths = lengths.slice(hlit + 257);
+
+    const literalTable = buildCanonicalHuffman(literalLengths);
+    const distanceTable = buildCanonicalHuffman(distanceLengths);
+
+    return {
+        literalTable,
+        distanceTable
+    }
+}
 
 function decodeSymbol(reader: BitReader, table: HuffmanTable): number {
 
@@ -301,7 +416,7 @@ function walkBytes(bytes: Uint8Array) {
 
         if (type == "IHDR") {
             const headerData = bytes.slice(offset, offset + length);
-            parseHeaderData(headerData);
+            pngHeader = parseHeaderData(headerData);
         }
         if (type == "IDAT") {
             idatChunks.push(
@@ -326,7 +441,6 @@ function mergeAllIdatChunks(): Uint8Array {
         0
     );
 
-    console.log(totalSize);
 
     const merged = new Uint8Array(totalSize);
 
@@ -340,17 +454,19 @@ function mergeAllIdatChunks(): Uint8Array {
     return merged;
 }
 
-function parseHeaderData(data: Uint8Array) {
+function parseHeaderData(data: Uint8Array): PngHeader {
     const width = readUInt32(data, 0);
     const height = readUInt32(data, 4);
 
-    const bitDepth = data[8];
-    const colorType = data[9];
+    const bitDepth = data[8]!;
+    const colorType = data[9]!;
 
-    console.log(`Width: ${width}`);
-    console.log(`Height: ${height}`);
-    console.log(`Bit Depth: ${bitDepth}`);
-    console.log(`Color Type: ${colorType}`);
+    return {
+        width,
+        height,
+        bitDepth,
+        colorType
+    };
 }
 
 function getChunkType(bytes: Uint8Array, offset: number): string {
@@ -372,5 +488,4 @@ function verifySignature(imageBytes: Uint8Array) {
             break;
         }
     }
-    console.log("Signature verified");
 }
